@@ -1,8 +1,8 @@
 ﻿## Interface: 30300
-## Title: |cff4db8ffEbonholdStuff|r |cff9aff4d[v1.2.0]|r
+## Title: |cff4db8ffEbonholdStuff|r |cff9aff4d[v1.2.6]|r
 ## Notes: |cffffb84dProject Ebonhold utility pack|r — Goblin Merchant Automation, Greedy Scavenger Spam Suppression, and Item Deletion Control.
 ## Author: James
-## Version: 1.2.0
+## Version: 1.2.6
 ## SavedVariables: EbonholdStuffDB
 
 EbonholdStuff.lua
