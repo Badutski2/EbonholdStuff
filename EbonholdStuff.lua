@@ -206,6 +206,16 @@ local function EnsureDB()
     if type(DB.hideGreedyBubbles) ~= "boolean" then DB.hideGreedyBubbles = DB.muteGreedy end
 
     if type(DB.enableOnlyListedChars) ~= "boolean" then DB.enableOnlyListedChars = false end
+    if type(DB.autoInviteEnabled) ~= "boolean" then DB.autoInviteEnabled = false end
+    if type(DB.autoInviteKeywords) ~= "string" then DB.autoInviteKeywords = "inv,invite" end
+    if type(DB.autoInviteAutoLootRules) ~= "boolean" then DB.autoInviteAutoLootRules = false end
+    if type(DB.autoInviteLootRule) ~= "string" then DB.autoInviteLootRule = "freeforall" end
+    if type(DB.autoInviteAutoRaidConvert) ~= "boolean" then DB.autoInviteAutoRaidConvert = true end
+    if type(DB.autoInviteInviteRequester) ~= "boolean" then DB.autoInviteInviteRequester = false end
+
+    if type(DB.inventoryWorthTotal) ~= "number" then DB.inventoryWorthTotal = 0 end
+    if type(DB.inventoryWorthCount) ~= "number" then DB.inventoryWorthCount = 0 end
+
 
 if not DB._seededLists then
     if DB.blacklist and not next(DB.blacklist) then
@@ -274,6 +284,34 @@ end
 local function PrintNice(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff7fbfff[EbonholdStuff]|r " .. msg)
 end
+
+local function EHS_CalcInventoryWorthCopper()
+    local total = 0
+    for bag = 0, 4 do
+        local slots = GetContainerNumSlots(bag)
+        for slot = 1, slots do
+            local itemID = GetContainerItemID(bag, slot)
+            if itemID then
+                local texture, itemCount, locked = GetContainerItemInfo(bag, slot)
+                if itemCount and itemCount > 0 then
+                    local name, link, quality, level, minLevel, itemType, subType, stackCount, equipLoc, icon, sellPrice = GetItemInfo(itemID)
+                    if sellPrice and sellPrice > 0 then
+                        total = total + (sellPrice * itemCount)
+                    end
+                end
+            end
+        end
+    end
+    return total
+end
+
+local function EHS_RecordInventoryWorthSample()
+    if not DB then return end
+    local worth = EHS_CalcInventoryWorthCopper()
+    DB.inventoryWorthTotal = (DB.inventoryWorthTotal or 0) + worth
+    DB.inventoryWorthCount = (DB.inventoryWorthCount or 0) + 1
+end
+
 
 local EHS_activeIDBox = nil
 local EHS_Original_ChatEdit_InsertLink = ChatEdit_InsertLink
@@ -348,6 +386,157 @@ local function EHS_SummonGreedyWithDelay()
     if not DB or not DB.summonGreedy then return end
     EHS_Delay((DB and DB.summonDelay) or 1.6, SummonGreedyScavenger)
 end
+
+local EHS_LOOT_RULES = {
+    { text = "Free For All",        value = "freeforall" },
+    { text = "Round Robin",         value = "roundrobin" },
+    { text = "Group Loot",          value = "group" },
+    { text = "Need Before Greed",   value = "needbeforegreed" },
+    { text = "Master Loot",         value = "master" },
+}
+
+local function EHS_Trim(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function EHS_ParseInviteKeywords()
+    local s = (DB and DB.autoInviteKeywords) or ""
+    local out = {}
+    for token in string.gmatch(s, "([^,]+)") do
+        token = EHS_Trim(token):lower()
+        if token ~= "" then
+            out[#out + 1] = token
+        end
+    end
+    return out
+end
+
+local function EHS_MessageMatchesInviteKeyword(msg)
+    msg = EHS_Trim(EHS_StripCodes(msg or "")):lower()
+    if msg == "" then return false end
+    local kws = EHS_ParseInviteKeywords()
+    for i = 1, #kws do
+        local kw = kws[i]
+        if msg == kw then
+            return true
+        end
+        if msg:sub(1, #kw) == kw then
+            local nextc = msg:sub(#kw + 1, #kw + 1)
+            if nextc == "" or nextc == " " or nextc == "	" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function EHS_PlayerCanInvite()
+    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
+        return UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")
+    end
+    if GetNumPartyMembers and GetNumPartyMembers() > 0 then
+        return UnitIsGroupLeader("player")
+    end
+    return true
+end
+
+local function EHS_IsPartyFull()
+    if GetNumRaidMembers and GetNumRaidMembers() > 0 then return false end
+    return (GetNumPartyMembers and GetNumPartyMembers() or 0) >= 4
+end
+
+local function EHS_ApplyAutoLootRule()
+    if not DB or DB.autoInviteAutoLootRules ~= true then return end
+    if (GetNumPartyMembers and GetNumPartyMembers() or 0) == 0 and (GetNumRaidMembers and GetNumRaidMembers() or 0) == 0 then
+        return
+    end
+    if not (UnitIsGroupLeader("player") or (GetNumRaidMembers and GetNumRaidMembers() > 0 and UnitIsGroupAssistant("player"))) then
+        return
+    end
+
+    local method = DB.autoInviteLootRule or "freeforall"
+    if SetLootMethod then
+        if method == "master" then
+            local idx = 0
+            if GetNumRaidMembers and GetNumRaidMembers() > 0 and UnitInRaid then
+                idx = UnitInRaid("player") or 0
+            end
+            SetLootMethod(method, idx)
+        else
+            SetLootMethod(method)
+        end
+    end
+end
+
+local EHS_inviteThrottle = {}
+
+local function EHS_NormalizeInviteName(name)
+    name = EHS_Trim(EHS_StripCodes(name or ""))
+    if name == "" then return "" end
+    name = name:gsub("%-.*", "")
+    return name
+end
+
+local function EHS_InviteUnitWithHandling(targetName)
+    if not DB or DB.autoInviteEnabled ~= true then return end
+    if not EHS_IsAddonEnabledForChar() then return end
+
+    targetName = EHS_NormalizeInviteName(targetName)
+    if targetName == "" then return end
+
+    local now = (GetTime and GetTime()) or 0
+    local key = targetName:lower()
+    if EHS_inviteThrottle[key] and (now - EHS_inviteThrottle[key]) < 2.0 then
+        return
+    end
+    EHS_inviteThrottle[key] = now
+
+    local function doInvite()
+        if not EHS_PlayerCanInvite() then
+            PrintNice("Cannot invite right now (not leader/assistant).")
+            return
+        end
+        if InviteUnit then
+            InviteUnit(targetName)
+        end
+        if DB.autoInviteAutoLootRules == true then
+            EHS_Delay(0.4, EHS_ApplyAutoLootRule)
+        end
+    end
+
+    if DB.autoInviteAutoRaidConvert == true and EHS_IsPartyFull() and (GetNumRaidMembers and GetNumRaidMembers() or 0) == 0 and UnitIsGroupLeader("player") and ConvertToRaid then
+        ConvertToRaid()
+        EHS_Delay(0.4, doInvite)
+        if DB.autoInviteAutoLootRules == true then
+            EHS_Delay(0.8, EHS_ApplyAutoLootRule)
+        end
+    else
+        doInvite()
+    end
+end
+
+local function EHS_HandleAutoInviteWhisper(msg, author)
+    if not DB or DB.autoInviteEnabled ~= true then return end
+    if not msg or not author then return end
+    if EHS_MessageMatchesInviteKeyword(msg) then
+        local who = EHS_NormalizeInviteName(author)
+        if who ~= "" then
+            EHS_InviteUnitWithHandling(who)
+        end
+    end
+end
+
+local function EHS_HandleInviteRequesterMessage(msg)
+    if not DB or DB.autoInviteEnabled ~= true or DB.autoInviteInviteRequester ~= true then return end
+    msg = EHS_Trim(EHS_StripCodes(msg or ""))
+    if msg == "" then return end
+    if msg:sub(1, 1) ~= "#" then return end
+    local target = msg:match("^#([%w%-%_]+)")
+    if not target or target == "" then return end
+    EHS_InviteUnitWithHandling(target)
+end
+
 
 
 local pendingDelete = nil
@@ -471,7 +660,6 @@ local function DoNextAction()
     end
 
     if action.type == "sell" then
-        -- Track sold totals (best-effort; the game will reject unsellable items)
         DB.totalItemsSold = (DB.totalItemsSold or 0) + (action.count or 1)
         DB.soldItemCounts = DB.soldItemCounts or {}
         if action.itemID then
@@ -480,7 +668,6 @@ local function DoNextAction()
         UseContainerItem(action.bag, action.slot)
 
     elseif action.type == "delete" then
-        -- Track deleted totals (best-effort; protected by delete-list + popup auto-confirm)
         DB.totalItemsDeleted = (DB.totalItemsDeleted or 0) + (action.count or 1)
         DB.deletedItemCounts = DB.deletedItemCounts or {}
         if action.itemID then
@@ -530,7 +717,8 @@ local function StartRun()
 
     running = true
 
-    -- Repair first (Goblin Merchant gate is already satisfied by ShouldRunNow)
+    EHS_RecordInventoryWorthSample()
+
     if DB and DB.repairGear == true and CanMerchantRepair and CanMerchantRepair() and GetRepairAllCost and RepairAllItems then
         local repairCost, canRepair = GetRepairAllCost()
         if canRepair and repairCost and repairCost > 0 and GetMoney and GetMoney() >= repairCost then
@@ -582,7 +770,6 @@ local function StyleInputBox(editBox)
     if editBox.SetTextInsets then
         editBox:SetTextInsets(6, 6, 0, 0)
     end
-    -- In 3.3.5, InputBoxTemplate textures can sometimes overlap the text; force them behind.
     local n = editBox.GetName and editBox:GetName()
     if n then
         local left = _G[n .. "Left"]
@@ -594,6 +781,7 @@ local function StyleInputBox(editBox)
     end
     editBox:SetFrameLevel((editBox:GetParent() and editBox:GetParent():GetFrameLevel() or editBox:GetFrameLevel()) + 2)
 end
+
 
 
 local function CreateListUI(parent, titleText, setTableName, x, y)
@@ -674,6 +862,28 @@ local function CreateListUI(parent, titleText, setTableName, x, y)
         return false
     end
 
+    local function CreateTinyToggleButton(parentRow)
+        local b = CreateFrame("Button", nil, parentRow)
+        b:SetSize(44, 18)
+        b:SetNormalFontObject("GameFontNormalSmall")
+        b:SetHighlightFontObject("GameFontHighlightSmall")
+        b:SetPushedTextOffset(0, -1)
+
+        if b.SetBackdrop then
+            b:SetBackdrop({
+                bgFile = "Interface\\Buttons\\WHITE8x8",
+                edgeFile = "Interface\\Buttons\\WHITE8x8",
+                edgeSize = 1,
+                insets = { left = 1, right = 1, top = 1, bottom = 1 },
+            })
+            b:SetBackdropColor(0, 0, 0, 0.35)
+            b:SetBackdropBorderColor(0.35, 0.35, 0.35, 0.9)
+            b:SetScript("OnEnter", function(self) self:SetBackdropBorderColor(0.85, 0.85, 0.85, 1) end)
+            b:SetScript("OnLeave", function(self) self:SetBackdropBorderColor(0.35, 0.35, 0.35, 0.9) end)
+        end
+        return b
+    end
+
     local function Refresh()
         WipeRows()
 
@@ -696,15 +906,21 @@ local function CreateListUI(parent, titleText, setTableName, x, y)
             local name = GetItemInfo(id) or ("ItemID: " .. id)
 
             if MatchesSearch(id, name, searchText) then
+                local enabled = (DB[setTableName][id] == true)
+
                 local row = CreateFrame("Frame", nil, content)
                 row:SetPoint("TOPLEFT", 0, rowY)
                 row:SetSize(w - 30, 22)
 
                 local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
                 text:SetPoint("LEFT", 2, 0)
-                text:SetWidth(w - 120)
+                text:SetWidth(w - 200)
                 text:SetJustifyH("LEFT")
-                text:SetText(string.format("|cffb6ffb6%d|r  %s", id, name))
+                if enabled then
+                    text:SetText(string.format("|cffb6ffb6%d|r  %s", id, name))
+                else
+                    text:SetText(string.format("|cff808080%d  %s (disabled)|r", id, name))
+                end
 
                 local rm = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
                 rm:SetSize(72, 18)
@@ -712,6 +928,14 @@ local function CreateListUI(parent, titleText, setTableName, x, y)
                 rm:SetText("Remove")
                 rm:SetScript("OnClick", function()
                     DB[setTableName][id] = nil
+                    Refresh()
+                end)
+
+                local tg = CreateTinyToggleButton(row)
+                tg:SetPoint("RIGHT", rm, "LEFT", -6, 0)
+                tg:SetText(enabled and "On" or "Off")
+                tg:SetScript("OnClick", function()
+                    DB[setTableName][id] = (DB[setTableName][id] ~= true) and true or false
                     Refresh()
                 end)
 
@@ -753,6 +977,7 @@ local function CreateListUI(parent, titleText, setTableName, x, y)
     box.Refresh = Refresh
     return box
 end
+
 
 local function AddCheckbox(parent, name, anchor, labelText, getter, setter, yOff)
     local cb = CreateFrame("CheckButton", name, parent, "InterfaceOptionsCheckButtonTemplate")
@@ -846,6 +1071,13 @@ MainOptions:SetScript("OnShow", function(self)
         self.statsDeleted:SetText("Total Items Deleted: " .. tostring(DB.totalItemsDeleted or 0))
         self.statsRepairs:SetText("Total Repairs: " .. tostring(DB.totalRepairs or 0))
         self.statsRepairCost:SetText("Total Repair Cost: " .. CopperToColoredText(DB.totalRepairCopper or 0))
+        if self.statsAvgWorth then
+            local cnt = DB.inventoryWorthCount or 0
+            local total = DB.inventoryWorthTotal or 0
+            local avg = 0
+            if cnt > 0 then avg = math.floor((total / cnt) + 0.5) end
+            self.statsAvgWorth:SetText("Average Inventory Worth: " .. CopperToColoredText(avg))
+        end
 
         local mostID, mostCount = GetMostItem(DB.soldItemCounts)
         if mostID then
@@ -861,7 +1093,7 @@ MainOptions:SetScript("OnShow", function(self)
     end
     self.inited = true
 
-    MakeHeader(self, "EbonholdStuff v1.1.1", -16)
+    MakeHeader(self, "EbonholdStuff v1.2.0", -16)
 
     MakeLabel(self, "Welcome to |cffb6ffb6EbonholdStuff|r!", 16, -44)
     MakeLabel(self, "To use, target and interact with any |cffb6ffb6Goblin Merchant|r.", 16, -64)
@@ -888,8 +1120,13 @@ MainOptions:SetScript("OnShow", function(self)
     repairCost:SetPoint("TOPLEFT", repairs, "BOTTOMLEFT", 0, -6)
     self.statsRepairCost = repairCost
 
+    local avgWorth = self:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    avgWorth:SetPoint("TOPLEFT", repairCost, "BOTTOMLEFT", 0, -6)
+    self.statsAvgWorth = avgWorth
+
+
     local mostSold = self:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    mostSold:SetPoint("TOPLEFT", repairCost, "BOTTOMLEFT", 0, -6)
+    mostSold:SetPoint("TOPLEFT", avgWorth, "BOTTOMLEFT", 0, -6)
     mostSold:SetWidth(560)
     mostSold:SetJustifyH("LEFT")
     self.statsMostSold = mostSold
@@ -904,6 +1141,8 @@ MainOptions:SetScript("OnShow", function(self)
         DB.totalItemsDeleted = 0
         DB.totalRepairs = 0
         DB.totalRepairCopper = 0
+        DB.inventoryWorthTotal = 0
+        DB.inventoryWorthCount = 0
         wipe(DB.soldItemCounts)
         wipe(DB.deletedItemCounts)
         RefreshStats()
@@ -915,7 +1154,6 @@ end)
 
 InterfaceOptions_AddCategory(MainOptions)
 
--- Merchant Settings (Vendoring + Repair)
 local MerchantPanel = CreateFrame("Frame", "EbonholdStuffOptionsMerchant", InterfaceOptionsFramePanelContainer)
 MerchantPanel.name = "Merchant Settings"
 MerchantPanel.parent = "EbonholdStuff"
@@ -1050,9 +1288,171 @@ DeletePanel:SetScript("OnShow", function(self)
     self.listUI:Refresh()
 end)
 
+
 InterfaceOptions_AddCategory(DeletePanel)
 
+local AutoInvitePanel = CreateFrame("Frame", "EbonholdStuffOptionsAutoInviting", InterfaceOptionsFramePanelContainer)
+AutoInvitePanel.name = "Auto-Inviting"
+AutoInvitePanel.parent = "EbonholdStuff"
+
+AutoInvitePanel:SetScript("OnShow", function(self)
+    EnsureDB()
+    if self.inited then
+        if self.enableCB then self.enableCB:SetChecked(DB.autoInviteEnabled) end
+        if self.kwBox then self.kwBox:SetText(DB.autoInviteKeywords or "inv,invite") end
+        if self.lootCB then self.lootCB:SetChecked(DB.autoInviteAutoLootRules) end
+        if self.raidCB then self.raidCB:SetChecked(DB.autoInviteAutoRaidConvert) end
+        if self.reqCB then self.reqCB:SetChecked(DB.autoInviteInviteRequester) end
+        if self.RefreshLootDropDown then self:RefreshLootDropDown() end
+        return
+    end
+    self.inited = true
+
+    MakeHeader(self, "Auto-Inviting", -16)
+    MakeLabel(self, "Automatically invite players when they whisper one of your keywords.", 16, -44)
+
+    local enableCB = CreateFrame("CheckButton", "EbonholdStuffAutoInviteEnableCB", self, "InterfaceOptionsCheckButtonTemplate")
+    enableCB:SetPoint("TOPLEFT", 16, -76)
+    enableCB:SetChecked(DB.autoInviteEnabled)
+    local et = _G[enableCB:GetName() .. "Text"]
+    if et then
+        et:SetText("Enable Auto Inviting")
+        et:SetWidth(420)
+        et:SetJustifyH("LEFT")
+    end
+    enableCB:SetScript("OnClick", function()
+        DB.autoInviteEnabled = enableCB:GetChecked() and true or false
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end)
+    self.enableCB = enableCB
+
+    local kwLabel = self:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    kwLabel:SetPoint("TOPLEFT", enableCB, "BOTTOMLEFT", 0, -12)
+    kwLabel:SetText("Invite Keyword (comma separated):")
+
+    local kwBox = CreateFrame("EditBox", "EbonholdStuffAutoInviteKeywordBox", self, "InputBoxTemplate")
+    kwBox:SetAutoFocus(false)
+    kwBox:SetSize(240, 20)
+    kwBox:SetPoint("TOPLEFT", kwLabel, "BOTTOMLEFT", 0, -6)
+    kwBox:SetMaxLetters(120)
+    kwBox:SetText(DB.autoInviteKeywords or "inv,invite")
+    StyleInputBox(kwBox)
+
+    local function SaveKeywords()
+        DB.autoInviteKeywords = EHS_Trim(kwBox:GetText() or "")
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end
+    kwBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); SaveKeywords() end)
+    kwBox:SetScript("OnEditFocusLost", function() SaveKeywords() end)
+    self.kwBox = kwBox
+
+    local lootCB = CreateFrame("CheckButton", "EbonholdStuffAutoInviteLootCB", self, "InterfaceOptionsCheckButtonTemplate")
+    lootCB:SetPoint("TOPLEFT", kwBox, "BOTTOMLEFT", -2, -14)
+    lootCB:SetChecked(DB.autoInviteAutoLootRules)
+    local lt = _G[lootCB:GetName() .. "Text"]
+    if lt then
+        lt:SetText("Enable Auto Loot Rules")
+        lt:SetWidth(420)
+        lt:SetJustifyH("LEFT")
+    end
+    lootCB:SetScript("OnClick", function()
+        DB.autoInviteAutoLootRules = lootCB:GetChecked() and true or false
+        if self.RefreshLootDropDown then self:RefreshLootDropDown() end
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end)
+    self.lootCB = lootCB
+
+    local ddLabel = self:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    ddLabel:SetPoint("TOPLEFT", lootCB, "BOTTOMLEFT", 2, -10)
+    ddLabel:SetText("Loot Rule:")
+
+    local lootDD = CreateFrame("Frame", "EbonholdStuffAutoInviteLootRuleDropDown", self, "UIDropDownMenuTemplate")
+    lootDD:SetPoint("TOPLEFT", ddLabel, "BOTTOMLEFT", -16, -2)
+    UIDropDownMenu_SetWidth(lootDD, 180)
+
+    UIDropDownMenu_Initialize(lootDD, function(frame, level)
+        local info = UIDropDownMenu_CreateInfo()
+        for i = 1, #EHS_LOOT_RULES do
+            local opt = EHS_LOOT_RULES[i]
+            info.text = opt.text
+            info.value = opt.value
+            info.checked = (DB.autoInviteLootRule == opt.value)
+            info.func = function()
+                DB.autoInviteLootRule = opt.value
+                UIDropDownMenu_SetSelectedValue(lootDD, opt.value)
+                UIDropDownMenu_SetText(lootDD, opt.text)
+                PlaySound("igMainMenuOptionCheckBoxOn")
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+
+    function self:RefreshLootDropDown()
+        local current = DB.autoInviteLootRule or "freeforall"
+        local label = nil
+        for i = 1, #EHS_LOOT_RULES do
+            if EHS_LOOT_RULES[i].value == current then
+                label = EHS_LOOT_RULES[i].text
+                break
+            end
+        end
+        if not label then
+            label = "Free For All"
+            DB.autoInviteLootRule = "freeforall"
+            current = "freeforall"
+        end
+        UIDropDownMenu_SetSelectedValue(lootDD, current)
+        UIDropDownMenu_SetText(lootDD, label)
+        if DB.autoInviteAutoLootRules == true then
+            if UIDropDownMenu_EnableDropDown then UIDropDownMenu_EnableDropDown(lootDD) end
+        else
+            if UIDropDownMenu_DisableDropDown then UIDropDownMenu_DisableDropDown(lootDD) end
+        end
+    end
+
+    self:RefreshLootDropDown()
+
+    local raidCB = CreateFrame("CheckButton", "EbonholdStuffAutoInviteRaidConvertCB", self, "InterfaceOptionsCheckButtonTemplate")
+    raidCB:SetPoint("TOPLEFT", lootDD, "BOTTOMLEFT", 16, -10)
+    raidCB:SetChecked(DB.autoInviteAutoRaidConvert)
+    local rct = _G[raidCB:GetName() .. "Text"]
+    if rct then
+        rct:SetText("Enable Automatic Raid Conversion")
+        rct:SetWidth(420)
+        rct:SetJustifyH("LEFT")
+    end
+    raidCB:SetScript("OnClick", function()
+        DB.autoInviteAutoRaidConvert = raidCB:GetChecked() and true or false
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end)
+    self.raidCB = raidCB
+
+    local reqCB = CreateFrame("CheckButton", "EbonholdStuffAutoInviteRequesterCB", self, "InterfaceOptionsCheckButtonTemplate")
+    reqCB:SetPoint("TOPLEFT", raidCB, "BOTTOMLEFT", 0, -8)
+    reqCB:SetChecked(DB.autoInviteInviteRequester)
+    local qct = _G[reqCB:GetName() .. "Text"]
+    if qct then
+        qct:SetText("Enable Invite Requester")
+        qct:SetWidth(420)
+        qct:SetJustifyH("LEFT")
+    end
+    reqCB:SetScript("OnClick", function()
+        DB.autoInviteInviteRequester = reqCB:GetChecked() and true or false
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end)
+    self.reqCB = reqCB
+
+    local desc = self:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    desc:SetPoint("TOPLEFT", reqCB, "BOTTOMLEFT", 4, -2)
+    desc:SetWidth(560)
+    desc:SetJustifyH("LEFT")
+    desc:SetText("Allows members of the Party / Raid to invite others with the keyword #name")
+end)
+
+InterfaceOptions_AddCategory(AutoInvitePanel)
+
 local ScavengerPanel = CreateFrame("Frame", "EbonholdStuffOptionsScavenger", InterfaceOptionsFramePanelContainer)
+
 ScavengerPanel.name = "Scavenger Settings"
 ScavengerPanel.parent = "EbonholdStuff"
 
@@ -1085,21 +1485,6 @@ ScavengerPanel:SetScript("OnShow", function(self)
         PlaySound("igMainMenuOptionCheckBoxOn")
     end)
     self.sumCB = sumCB
-    
---[[
-    local muteCB = AddCheckbox(self, "EbonholdStuffMuteGreedyCB", delaySlider, "Mute |cffff7f7fGreedy Scavenger|r",
-        function() return DB.muteGreedy end,
-        function(v)
-            DB.muteGreedy = v
-            if v then
-                DB.hideGreedyChat = true
-                DB.hideGreedyBubbles = true
-            end
-            ApplyGreedyChatFilter()
-        end,
-        -12)
-    self.muteCB = muteCB
---]]
 
     local chatCB = AddCheckbox(self, "EbonholdStuffHideGreedyChatCB", sumCB, "Hide |cffff7f7fGreedy Scavenger|r's chat messages",
         function() return DB.hideGreedyChat end,
@@ -1294,13 +1679,24 @@ f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("MERCHANT_SHOW")
 f:RegisterEvent("MERCHANT_CLOSED")
 
-f:SetScript("OnEvent", function(self, event, arg1)
-    if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
-        EnsureDB()
-        HookDeletePopupOnce()
-        if ApplyGreedyChatFilter then ApplyGreedyChatFilter() end
+f:RegisterEvent("CHAT_MSG_WHISPER")
+f:RegisterEvent("CHAT_MSG_PARTY")
+f:RegisterEvent("CHAT_MSG_PARTY_LEADER")
+f:RegisterEvent("CHAT_MSG_RAID")
+f:RegisterEvent("CHAT_MSG_RAID_LEADER")
+
+f:SetScript("OnEvent", function(self, event, ...)
+    if event == "ADDON_LOADED" then
+        local addonName = ...
+        if addonName == ADDON_NAME then
+            EnsureDB()
+            HookDeletePopupOnce()
+            if ApplyGreedyChatFilter then ApplyGreedyChatFilter() end
+        end
+
     elseif event == "PLAYER_LOGOUT" then
         if DB then EbonholdStuffDB = DB end
+
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         EnsureDB()
         if EHS_InstallGreedyMuteOnce then EHS_InstallGreedyMuteOnce() end
@@ -1319,10 +1715,28 @@ f:SetScript("OnEvent", function(self, event, arg1)
         running = false
         worker:Hide()
         pendingDelete = nil
+
+    elseif event == "CHAT_MSG_WHISPER" then
+        EnsureDB()
+        if not EHS_IsAddonEnabledForChar() then return end
+        local msg, author = ...
+        if DB and DB.autoInviteEnabled == true then
+            EHS_HandleAutoInviteWhisper(msg, author)
+        end
+
+    elseif event == "CHAT_MSG_PARTY" or event == "CHAT_MSG_PARTY_LEADER"
+        or event == "CHAT_MSG_RAID" or event == "CHAT_MSG_RAID_LEADER" then
+        EnsureDB()
+        if not EHS_IsAddonEnabledForChar() then return end
+        local msg, author = ...
+        if DB and DB.autoInviteEnabled == true and DB.autoInviteInviteRequester == true then
+            EHS_HandleInviteRequesterMessage(msg)
+        end
     end
+
     if event == "PLAYER_LOGIN" then
         EHS_Delay(1, function()
             DEFAULT_CHAT_FRAME:AddMessage("|cffffd100EbonholdStuff Enabled|r - Use |cff00ff00/ehs|r to configure.")
         end)
-	end
+    end
 end)
